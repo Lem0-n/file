@@ -1,5 +1,7 @@
 use std::env;
-use std::fs;
+use std::ffi::CString;
+use std::os::fd::RawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -7,6 +9,9 @@ use std::time::{Duration, Instant};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+const READ_BUF_SIZE: usize = 1 << 20;
+const INLINE_SUBDIR_THRESHOLD: usize = 4;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ScanResult {
@@ -36,48 +41,93 @@ impl ScanContext {
     }
 }
 
+#[inline]
+fn open_dir(path: &PathBuf) -> Option<RawFd> {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    let c_path = CString::new(bytes).ok()?;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
+    (fd >= 0).then_some(fd)
+}
+
 fn scan_dir(path: PathBuf, ctx: ScanContext) {
     let mut local_files = 0_u64;
     let mut local_dirs = 0_u64;
     let mut local_skipped_errors = 0_u64;
+    let mut discovered_subdirs: Vec<PathBuf> = Vec::with_capacity(16);
 
-    let entries = match fs::read_dir(&path) {
-        Ok(entries) => entries,
-        Err(_) => {
-            local_skipped_errors += 1;
-            ctx.skipped_errors
-                .fetch_add(local_skipped_errors, Ordering::Relaxed);
-            ctx.finish_task();
-            return;
-        }
+    let Some(fd) = open_dir(&path) else {
+        ctx.skipped_errors.fetch_add(1, Ordering::Relaxed);
+        ctx.finish_task();
+        return;
     };
 
-    for entry_res in entries {
-        let entry = match entry_res {
-            Ok(entry) => entry,
-            Err(_) => {
-                local_skipped_errors += 1;
-                continue;
-            }
+    let mut buf = vec![0_u8; READ_BUF_SIZE];
+
+    loop {
+        let nread = unsafe {
+            libc::syscall(
+                libc::SYS_getdents64,
+                fd,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+            )
         };
 
-        let ft = match entry.file_type() {
-            Ok(ft) => ft,
-            Err(_) => {
-                local_skipped_errors += 1;
-                continue;
-            }
-        };
-
-        if ft.is_dir() {
-            local_dirs += 1;
-            ctx.active_tasks.fetch_add(1, Ordering::Release);
-            let child_ctx = ctx.clone();
-            let child_path = entry.path();
-            rayon::spawn(move || scan_dir(child_path, child_ctx));
-        } else {
-            local_files += 1;
+        if nread == 0 {
+            break;
         }
+        if nread < 0 {
+            local_skipped_errors += 1;
+            break;
+        }
+
+        let nread = nread as usize;
+        let mut bpos = 0_usize;
+        while bpos < nread {
+            let base = unsafe { buf.as_ptr().add(bpos) };
+            let reclen = unsafe { *(base.add(16) as *const u16) } as usize;
+            if reclen == 0 || bpos + reclen > nread {
+                local_skipped_errors += 1;
+                break;
+            }
+
+            let d_type = unsafe { *base.add(18) };
+            let name_ptr = unsafe { base.add(19) };
+            let name_len = reclen.saturating_sub(19);
+            let name_slice = unsafe { std::slice::from_raw_parts(name_ptr, name_len) };
+            let nul_pos = name_slice
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(name_slice.len());
+            let name = &name_slice[..nul_pos];
+
+            if name != b"." && name != b".." {
+                match d_type {
+                    libc::DT_DIR => {
+                        local_dirs += 1;
+                        let mut child = path.clone();
+                        child.push(std::ffi::OsStr::from_bytes(name));
+                        discovered_subdirs.push(child);
+                    }
+                    libc::DT_LNK => {
+                        local_files += 1;
+                    }
+                    libc::DT_UNKNOWN => {
+                        local_files += 1;
+                    }
+                    _ => {
+                        local_files += 1;
+                    }
+                }
+            }
+
+            bpos += reclen;
+        }
+    }
+
+    unsafe {
+        libc::close(fd);
     }
 
     if local_files > 0 {
@@ -89,6 +139,19 @@ fn scan_dir(path: PathBuf, ctx: ScanContext) {
     if local_skipped_errors > 0 {
         ctx.skipped_errors
             .fetch_add(local_skipped_errors, Ordering::Relaxed);
+    }
+
+    if discovered_subdirs.len() <= INLINE_SUBDIR_THRESHOLD {
+        for p in discovered_subdirs {
+            ctx.active_tasks.fetch_add(1, Ordering::Release);
+            scan_dir(p, ctx.clone());
+        }
+    } else {
+        for p in discovered_subdirs {
+            ctx.active_tasks.fetch_add(1, Ordering::Release);
+            let child_ctx = ctx.clone();
+            rayon::spawn(move || scan_dir(p, child_ctx));
+        }
     }
 
     ctx.finish_task();
