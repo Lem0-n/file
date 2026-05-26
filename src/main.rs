@@ -13,7 +13,7 @@ use crossbeam_channel::Sender;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const READ_BUF_SIZE: usize = 1 << 20;
-const INLINE_SUBDIR_THRESHOLD: usize = 8;
+const INLINE_SUBDIR_THRESHOLD: usize = 12;
 const EMIT_FLUSH_THRESHOLD: usize = 256 * 1024;
 const EMIT_BUF_CAP: usize = 512 * 1024;
 
@@ -214,11 +214,11 @@ fn scan_dir(task: DirTask, ctx: ScanContext) {
     ctx.finish_task();
 }
 
-pub fn scan_tree_max_speed(root: PathBuf, emit_paths: bool) -> ScanResult {
+pub fn scan_tree_max_speed(root: PathBuf) -> ScanResult {
     let started = Instant::now();
 
-    let (tx, writer_thread) = if emit_paths {
-        let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+    let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(1024);
+    let writer_thread = {
         let t = std::thread::spawn(move || {
             let stdout = io::stdout();
             let mut out = BufWriter::with_capacity(8 * 1024 * 1024, stdout.lock());
@@ -227,9 +227,7 @@ pub fn scan_tree_max_speed(root: PathBuf, emit_paths: bool) -> ScanResult {
             }
             let _ = out.flush();
         });
-        (Some(tx), Some(t))
-    } else {
-        (None, None)
+        t
     };
 
     let files = Arc::new(AtomicU64::new(0));
@@ -242,7 +240,7 @@ pub fn scan_tree_max_speed(root: PathBuf, emit_paths: bool) -> ScanResult {
         skipped_errors: skipped_errors.clone(),
         active_tasks: Arc::new(AtomicU64::new(1)),
         done: Arc::new((Mutex::new(false), Condvar::new())),
-        tx,
+        tx: Some(tx),
     };
 
     let root_fd = match open_root(&root) {
@@ -259,11 +257,7 @@ pub fn scan_tree_max_speed(root: PathBuf, emit_paths: bool) -> ScanResult {
 
     let root_task = DirTask {
         fd: root_fd,
-        path_bytes: if emit_paths {
-            Some(root.as_os_str().as_bytes().to_vec())
-        } else {
-            None
-        },
+        path_bytes: Some(root.as_os_str().as_bytes().to_vec()),
     };
 
     let root_ctx = ctx.clone();
@@ -278,9 +272,7 @@ pub fn scan_tree_max_speed(root: PathBuf, emit_paths: bool) -> ScanResult {
     }
 
     drop(ctx);
-    if let Some(t) = writer_thread {
-        let _ = t.join();
-    }
+    let _ = writer_thread.join();
 
     ScanResult {
         files: files.load(Ordering::Relaxed),
@@ -298,15 +290,10 @@ fn parse_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn parse_emit_paths() -> bool {
-    env::var_os("FASTSCAN_PRINT_PATHS").is_some()
-}
-
 fn main() {
     let root = parse_root();
-    let emit_paths = parse_emit_paths();
 
-    let result = scan_tree_max_speed(root.clone(), emit_paths);
+    let result = scan_tree_max_speed(root.clone());
     let total = result.files + result.dirs;
 
     eprintln!("root: {}", root.display());
