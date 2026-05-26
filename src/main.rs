@@ -1,5 +1,4 @@
 use std::env;
-use std::ffi::CString;
 use std::io::{self, BufWriter, Write};
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
@@ -14,7 +13,7 @@ use crossbeam_channel::Sender;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const READ_BUF_SIZE: usize = 1 << 20;
-const INLINE_SUBDIR_THRESHOLD: usize = 4;
+const INLINE_SUBDIR_THRESHOLD: usize = 8;
 const EMIT_FLUSH_THRESHOLD: usize = 256 * 1024;
 const EMIT_BUF_CAP: usize = 512 * 1024;
 
@@ -36,6 +35,12 @@ struct ScanContext {
     tx: Option<Sender<Vec<u8>>>,
 }
 
+#[derive(Clone)]
+struct DirTask {
+    fd: RawFd,
+    path_bytes: Option<Vec<u8>>,
+}
+
 impl ScanContext {
     #[inline]
     fn finish_task(&self) {
@@ -49,27 +54,33 @@ impl ScanContext {
 }
 
 #[inline]
-fn open_dir(path: &PathBuf) -> Option<RawFd> {
+fn open_root(path: &PathBuf) -> Option<RawFd> {
     let bytes = path.as_os_str().as_encoded_bytes();
-    let c_path = CString::new(bytes).ok()?;
+    let c_path = std::ffi::CString::new(bytes).ok()?;
     let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
     let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
     (fd >= 0).then_some(fd)
 }
 
 #[inline]
-fn enqueue_line(
-    buf: &mut Vec<u8>,
-    tx: &Sender<Vec<u8>>,
-    base: &[u8],
-    has_trailing: bool,
-    name: &[u8],
-) {
-    buf.extend_from_slice(base);
-    if !has_trailing {
-        buf.push(b'/');
+fn open_child_dir(parent_fd: RawFd, name: &[u8]) -> Option<RawFd> {
+    let c_name = std::ffi::CString::new(name).ok()?;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(parent_fd, c_name.as_ptr(), flags) };
+    (fd >= 0).then_some(fd)
+}
+
+#[inline]
+fn enqueue_line(buf: &mut Vec<u8>, tx: &Sender<Vec<u8>>, base: Option<&[u8]>, name: &[u8]) {
+    if let Some(base) = base {
+        buf.extend_from_slice(base);
+        if !base.ends_with(b"/") {
+            buf.push(b'/');
+        }
+        buf.extend_from_slice(name);
+    } else {
+        buf.extend_from_slice(name);
     }
-    buf.extend_from_slice(name);
     buf.push(b'\n');
 
     if buf.len() >= EMIT_FLUSH_THRESHOLD {
@@ -79,24 +90,15 @@ fn enqueue_line(
     }
 }
 
-fn scan_dir(path: PathBuf, ctx: ScanContext) {
+fn scan_dir(task: DirTask, ctx: ScanContext) {
     let mut local_files = 0_u64;
     let mut local_dirs = 0_u64;
     let mut local_skipped_errors = 0_u64;
-    let mut discovered_subdirs: Vec<PathBuf> = Vec::with_capacity(16);
+    let mut discovered: Vec<DirTask> = Vec::with_capacity(16);
     let mut emit_buf = if ctx.tx.is_some() {
         Vec::with_capacity(EMIT_BUF_CAP)
     } else {
         Vec::new()
-    };
-
-    let base_bytes = path.as_os_str().as_bytes();
-    let has_trailing = base_bytes.ends_with(b"/");
-
-    let Some(fd) = open_dir(&path) else {
-        ctx.skipped_errors.fetch_add(1, Ordering::Relaxed);
-        ctx.finish_task();
-        return;
     };
 
     let mut buf = vec![0_u8; READ_BUF_SIZE];
@@ -105,7 +107,7 @@ fn scan_dir(path: PathBuf, ctx: ScanContext) {
         let nread = unsafe {
             libc::syscall(
                 libc::SYS_getdents64,
-                fd,
+                task.fd,
                 buf.as_mut_ptr() as *mut libc::c_void,
                 buf.len(),
             )
@@ -139,20 +141,36 @@ fn scan_dir(path: PathBuf, ctx: ScanContext) {
                 .unwrap_or(name_slice.len());
             let name = &name_slice[..nul_pos];
 
-            if name != b"." && name != b".." {
-                if let Some(tx) = &ctx.tx {
-                    enqueue_line(&mut emit_buf, tx, base_bytes, has_trailing, name);
-                }
+            if name == b"." || name == b".." {
+                bpos += reclen;
+                continue;
+            }
 
-                match d_type {
-                    libc::DT_DIR => {
-                        local_dirs += 1;
-                        let mut child = path.clone();
-                        child.push(std::ffi::OsStr::from_bytes(name));
-                        discovered_subdirs.push(child);
-                    }
-                    _ => local_files += 1,
+            if let Some(tx) = &ctx.tx {
+                enqueue_line(&mut emit_buf, tx, task.path_bytes.as_deref(), name);
+            }
+
+            if d_type == libc::DT_DIR {
+                if let Some(child_fd) = open_child_dir(task.fd, name) {
+                    local_dirs += 1;
+                    let child_path = task.path_bytes.as_ref().map(|p| {
+                        let mut v = Vec::with_capacity(p.len() + 1 + name.len());
+                        v.extend_from_slice(p);
+                        if !p.ends_with(b"/") {
+                            v.push(b'/');
+                        }
+                        v.extend_from_slice(name);
+                        v
+                    });
+                    discovered.push(DirTask {
+                        fd: child_fd,
+                        path_bytes: child_path,
+                    });
+                } else {
+                    local_skipped_errors += 1;
                 }
+            } else {
+                local_files += 1;
             }
 
             bpos += reclen;
@@ -160,7 +178,7 @@ fn scan_dir(path: PathBuf, ctx: ScanContext) {
     }
 
     unsafe {
-        libc::close(fd);
+        libc::close(task.fd);
     }
 
     if let Some(tx) = &ctx.tx {
@@ -180,16 +198,16 @@ fn scan_dir(path: PathBuf, ctx: ScanContext) {
             .fetch_add(local_skipped_errors, Ordering::Relaxed);
     }
 
-    if discovered_subdirs.len() <= INLINE_SUBDIR_THRESHOLD {
-        for p in discovered_subdirs {
+    if discovered.len() <= INLINE_SUBDIR_THRESHOLD {
+        for child in discovered {
             ctx.active_tasks.fetch_add(1, Ordering::Release);
-            scan_dir(p, ctx.clone());
+            scan_dir(child, ctx.clone());
         }
     } else {
-        for p in discovered_subdirs {
+        for child in discovered {
             ctx.active_tasks.fetch_add(1, Ordering::Release);
             let child_ctx = ctx.clone();
-            rayon::spawn(move || scan_dir(p, child_ctx));
+            rayon::spawn(move || scan_dir(child, child_ctx));
         }
     }
 
@@ -203,7 +221,7 @@ pub fn scan_tree_max_speed(root: PathBuf, emit_paths: bool) -> ScanResult {
         let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
         let t = std::thread::spawn(move || {
             let stdout = io::stdout();
-            let mut out = BufWriter::with_capacity(4 * 1024 * 1024, stdout.lock());
+            let mut out = BufWriter::with_capacity(8 * 1024 * 1024, stdout.lock());
             while let Ok(chunk) = rx.recv() {
                 let _ = out.write_all(&chunk);
             }
@@ -227,8 +245,29 @@ pub fn scan_tree_max_speed(root: PathBuf, emit_paths: bool) -> ScanResult {
         tx,
     };
 
+    let root_fd = match open_root(&root) {
+        Some(fd) => fd,
+        None => {
+            return ScanResult {
+                files: 0,
+                dirs: 0,
+                skipped_errors: 1,
+                elapsed: started.elapsed(),
+            };
+        }
+    };
+
+    let root_task = DirTask {
+        fd: root_fd,
+        path_bytes: if emit_paths {
+            Some(root.as_os_str().as_bytes().to_vec())
+        } else {
+            None
+        },
+    };
+
     let root_ctx = ctx.clone();
-    rayon::spawn(move || scan_dir(root, root_ctx));
+    rayon::spawn(move || scan_dir(root_task, root_ctx));
 
     {
         let (lock, cv) = &*ctx.done;
